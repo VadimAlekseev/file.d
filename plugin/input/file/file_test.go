@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io/ioutil"
 	"math/rand"
+	"net/http"
 	"os"
 	"path"
 	"path/filepath"
@@ -13,6 +14,10 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/ozontech/file.d/plugin/output/devnull"
+	"github.com/ozontech/file.d/plugin/output/elasticsearch"
+	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/alecthomas/units"
 	"github.com/ozontech/file.d/cfg"
@@ -1104,12 +1109,12 @@ func TestTruncationSeq(t *testing.T) {
 //	assertOffsetsAreEqual(t, genOffsetsContentMultiple(files, 4*19), getContent(input.config.OffsetsFile))
 //}
 
-func BenchmarkLightJsonReadPar(b *testing.B) {
-	lines := 128 * 64
-	files := 256
+const lines = 128 * 64
+const files = 256
 
+func generateTmpFiles() int64 {
+	json := getContent("../../../testdata/json/light.json")
 	if fs, err := os.ReadDir(filesDir); err != nil || len(fs) == 0 {
-		json := getContent("../../../testdata/json/light.json")
 
 		content := make([]byte, 0, len(json)*lines)
 		for i := 0; i < lines; i++ {
@@ -1122,10 +1127,14 @@ func BenchmarkLightJsonReadPar(b *testing.B) {
 		}
 		logger.Infof("%s", filesDir)
 
-		bytes := int64(files * lines * len(json))
-		logger.Infof("will read %dMb", bytes/1024/1024)
-		b.SetBytes(bytes)
 	}
+	size := int64(files * lines * len(json))
+	logger.Infof("will read %dMb", size/1024/1024)
+	return size
+}
+
+func BenchmarkLightJsonReadPar1(b *testing.B) {
+	b.SetBytes(generateTmpFiles())
 
 	b.ReportAllocs()
 	b.StopTimer()
@@ -1155,4 +1164,117 @@ func BenchmarkLightJsonReadPar(b *testing.B) {
 
 		p.Stop()
 	}
+}
+
+func BenchmarkLightJsonReadPar2(b *testing.B) {
+	b.SetBytes(generateTmpFiles())
+
+	b.ReportAllocs()
+	b.StopTimer()
+	b.ResetTimer()
+	for n := 0; n < b.N; n++ {
+		p, output := NewPipelineMock(nil, "passive", "perf")
+
+		f, err := os.MkdirTemp("", "off")
+		if err != nil {
+			panic(err.Error())
+		}
+		offsetsDir = f
+		p.SetInput(getInputInfo())
+
+		wg := &sync.WaitGroup{}
+		wg.Add(lines * files * 2)
+
+		output.SetOutFn(func(event *pipeline.Event) {
+			wg.Done()
+		})
+
+		p.Start()
+
+		b.StartTimer()
+		wg.Wait()
+		b.StopTimer()
+
+		p.Stop()
+	}
+}
+
+func NewPipeline(actions []*pipeline.ActionPluginStaticInfo, pipelineOpts ...string) *pipeline.Pipeline {
+	parallel := test.Opts(pipelineOpts).Has("parallel")
+	perf := test.Opts(pipelineOpts).Has("perf")
+	mock := test.Opts(pipelineOpts).Has("mock")
+	elastic := test.Opts(pipelineOpts).Has("elastic")
+
+	if perf {
+		parallel = true
+	}
+
+	settings := &pipeline.Settings{
+		Capacity:            pipeline.DefaultCapacity,
+		MaintenanceInterval: pipeline.DefaultMaintenanceInterval,
+		EventTimeout:        pipeline.DefaultEventTimeout,
+		AntispamThreshold:   0,
+		AvgEventSize:        pipeline.DefaultAvgInputEventSize,
+		StreamField:         "stream",
+		Decoder:             "raw",
+	}
+
+	http.DefaultServeMux = &http.ServeMux{}
+	p := pipeline.New("test_pipeline", settings, prometheus.NewRegistry())
+	if !parallel {
+		p.DisableParallelism()
+	}
+
+	if !perf {
+		p.EnableEventLog()
+	}
+
+	if mock {
+		p.SetInput(getInputInfo())
+
+		if elastic {
+			anyPlugin, anyConfig := elasticsearch.Factory()
+			outputPlugin := anyPlugin.(*elasticsearch.Plugin)
+			elasticConfig := anyConfig.(*elasticsearch.Config)
+			elasticConfig.Endpoints = []string{"http://localhost:9200"}
+			elasticConfig.BatchSize = "200"
+			err := cfg.Parse(elasticConfig, map[string]int{"gomaxprocs": 1})
+			if err != nil {
+				panic(err.Error())
+			}
+			p.SetOutput(&pipeline.OutputPluginInfo{
+				PluginStaticInfo: &pipeline.PluginStaticInfo{
+					Type:   "elasticsearch",
+					Config: anyConfig,
+				},
+				PluginRuntimeInfo: &pipeline.PluginRuntimeInfo{
+					Plugin: outputPlugin,
+				},
+			})
+		} else {
+			anyPlugin, _ := devnull.Factory()
+			outputPlugin := anyPlugin.(*devnull.Plugin)
+			p.SetOutput(&pipeline.OutputPluginInfo{
+				PluginStaticInfo: &pipeline.PluginStaticInfo{
+					Type: "devnull",
+				},
+				PluginRuntimeInfo: &pipeline.PluginRuntimeInfo{
+					Plugin: outputPlugin,
+				},
+			})
+		}
+	}
+
+	for _, info := range actions {
+		p.AddAction(info)
+	}
+
+	return p
+}
+
+func NewPipelineMock(actions []*pipeline.ActionPluginStaticInfo, pipelineOpts ...string) (*pipeline.Pipeline, *elasticsearch.Plugin) {
+	pipelineOpts = append(pipelineOpts, "mock", "elastic")
+	p := NewPipeline(actions, pipelineOpts...)
+
+	return p, p.GetOutput().(*elasticsearch.Plugin)
 }
