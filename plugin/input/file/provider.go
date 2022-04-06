@@ -291,6 +291,7 @@ func (jp *jobProvider) addJob(file *os.File, stat os.FileInfo, filename string, 
 	// check again in case when the file was created, removed (or renamed) and created again.
 	_, has := jp.jobs[sourceID]
 	if has {
+		// TODO: close file here?
 		jp.logger.Warnf("job for a file %q was already created", filename)
 		return
 	}
@@ -609,7 +610,9 @@ func (jp *jobProvider) maintenanceJob(job *Job) int {
 
 	// filename was changed
 	if filepath.Base(job.filename) != stat.Name() {
+		// todo: need reopen file here?
 		job.filename = filepath.Dir(job.filename) + stat.Name()
+		// is file correct?
 		job.mu.Unlock()
 
 		return maintenanceResultNoop
@@ -628,7 +631,7 @@ func (jp *jobProvider) maintenanceJob(job *Job) int {
 		panic("")
 	}
 
-	// todo: here we may have symlink opened, so handle it
+	// todo: here we may have symlink opened, so handle it?
 	file, err = os.Open(filename)
 	if err != nil {
 		jp.deleteJobAndUnlock(job)
