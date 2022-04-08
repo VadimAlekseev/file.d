@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/ozontech/file.d/cfg"
@@ -30,12 +31,13 @@ const (
 )
 
 type Plugin struct {
-	config         *Config
-	client         http.Client
-	logger         *zap.SugaredLogger
-	avgEventSize   int
-	batcher        *pipeline.Batcher
-	controller     pipeline.OutputPluginController
+	config       *Config
+	client       http.Client
+	logger       *zap.SugaredLogger
+	avgEventSize int
+	batcher      *pipeline.Batcher
+	controller   pipeline.OutputPluginController
+	debugFn      func(node *insaneJSON.Node) bool
 }
 
 //! config-params
@@ -91,12 +93,17 @@ func Factory() (pipeline.AnyPlugin, pipeline.AnyConfig) {
 	return &Plugin{}, &Config{}
 }
 
+func debugFn(node *insaneJSON.Node) bool {
+	return strings.HasPrefix(node.Dig("k8s_container").AsString(), "auth-relay")
+}
+
 func (p *Plugin) Start(config pipeline.AnyConfig, params *pipeline.OutputPluginParams) {
 	p.controller = params.Controller
 	p.logger = params.Logger
 	p.avgEventSize = params.PipelineSettings.AvgEventSize
 	p.config = config.(*Config)
 	p.client = p.newClient(p.config.RequestTimeout_)
+	p.debugFn = debugFn
 
 	p.registerPluginMetrics()
 
@@ -146,7 +153,13 @@ func (p *Plugin) out(workerData *pipeline.WorkerData, batch *pipeline.Batch) {
 
 	root := insaneJSON.Spawn()
 	outBuf := data.outBuf[:0]
+
+	var debugPrint bool
+
 	for _, event := range batch.Events {
+		if p.debugFn != nil && !debugPrint && p.debugFn(event.Root.Node) {
+			debugPrint = true
+		}
 		root.AddField("event").MutateToNode(event.Root.Node)
 		outBuf = root.Encode(outBuf)
 		_ = root.DecodeString("{}")
@@ -155,6 +168,9 @@ func (p *Plugin) out(workerData *pipeline.WorkerData, batch *pipeline.Batch) {
 	data.outBuf = outBuf
 
 	for {
+		if debugPrint {
+			p.logger.Infof("debug e73b9964-b734-11ec-91b7-6684ea2e2a32 for splunk plugin: trying to send: %s", string(outBuf))
+		}
 		err := p.send(outBuf)
 		if err != nil {
 			stats.GetCounter(subsystemName, sendErrorCounter).Inc()
@@ -165,6 +181,9 @@ func (p *Plugin) out(workerData *pipeline.WorkerData, batch *pipeline.Batch) {
 		}
 
 		break
+	}
+	if debugPrint {
+		p.logger.Infof("debug e73b9964-b734-11ec-91b7-6684ea2e2a32 for splunk plugin: successfully sent: %s", string(outBuf))
 	}
 }
 
