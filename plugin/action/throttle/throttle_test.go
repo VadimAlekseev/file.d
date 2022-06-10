@@ -3,16 +3,21 @@ package throttle
 import (
 	"fmt"
 	"math/rand"
+	"runtime"
+	"strconv"
+	"strings"
+	"sync"
 	"testing"
 	"time"
-
-	"github.com/stretchr/testify/assert"
-	"go.uber.org/atomic"
 
 	"github.com/ozontech/file.d/cfg"
 	"github.com/ozontech/file.d/logger"
 	"github.com/ozontech/file.d/pipeline"
 	"github.com/ozontech/file.d/test"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	insaneJSON "github.com/vitkovskii/insane-json"
+	"go.uber.org/zap"
 )
 
 type testConfig struct {
@@ -28,14 +33,38 @@ var formats = []string{
 	`{"time":"%s","k8s_ns":"not_matched","k8s_pod":"pod_3"}`,
 }
 
-func (c *testConfig) runPipeline(t *testing.T) {
-	p, input, output := test.NewPipelineMock(test.NewActionPluginStaticInfo(factory, c.config, pipeline.MatchModeAnd, nil, false))
-	wgWithDeadline := atomic.NewInt32(int32(c.eventsTotal))
+func goid() int {
+	var buf [64]byte
+	n := runtime.Stack(buf[:], false)
+	idField := strings.Fields(strings.TrimPrefix(string(buf[:n]), "goroutine "))[0]
+	id, err := strconv.Atoi(idField)
+	if err != nil {
+		panic(fmt.Sprintf("cannot get goroutine id: %v", err))
+	}
+	return id
+}
 
-	outEvents := make([]*pipeline.Event, 0)
+func (c *testConfig) runPipeline() int {
+	logger.Level.SetLevel(zap.PanicLevel)
+	p, input, output := test.NewPipelineMock(test.NewActionPluginStaticInfo(factory, c.config, pipeline.MatchModeAnd, nil, false))
+
+	var outEvents int
+	countByRule := map[string]int{}
+	mx := &sync.RWMutex{}
+
 	output.SetOutFn(func(e *pipeline.Event) {
-		outEvents = append(outEvents, e)
-		wgWithDeadline.Dec()
+		mx.Lock()
+		defer mx.Unlock()
+
+		pod := e.Root.Dig("k8s_ns").AsString()
+		countByRule[pod]++
+		if pod != "not_matched" && pod != "ns_2" && pod != "ns_1" {
+			panic(fmt.Errorf("invalid enum: %s 3", pod))
+		}
+
+		fmt.Println(e.Root.EncodeToString())
+
+		outEvents++
 	})
 
 	sourceNames := []string{
@@ -56,17 +85,59 @@ func (c *testConfig) runPipeline(t *testing.T) {
 	}
 
 	p.Stop()
-	tnow := time.Now()
+
+	//tnow := time.Now()
 	for {
-		if wgWithDeadline.Load() <= 0 || time.Since(tnow) > 10*time.Second {
+		if c.eventsTotal <= outEvents {
 			break
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
 
-	// if we have not generated the required amount messages for any bucket,
-	// then we check the amount generated messages (outEvents) does not exceed the limit (eventsTotal)
-	assert.True(c.t, c.eventsTotal <= len(outEvents), "wrong in events count")
+	mx.Lock()
+	defer mx.Unlock()
+	fmt.Printf("countByRule: %#v\n", countByRule)
+
+	time.Sleep(time.Second * 5)
+
+	return outEvents
+}
+
+func TestInsaneJSON_Dig(t *testing.T) {
+	original, err := insaneJSON.DecodeString(formats[0])
+	require.NoError(t, err)
+
+	expect := original.Dig("k8s_ns").AsString()
+
+	stop := make(chan struct{})
+
+	for i := 0; i < 10; i++ {
+		go func() {
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+					fake, err := insaneJSON.DecodeString(formats[2])
+					require.NoError(t, err)
+					insaneJSON.Release(fake)
+				}
+			}
+		}()
+	}
+
+	for i := 0; i < 1_000_000; i++ {
+		runtime.Gosched()
+		current, err := insaneJSON.DecodeString(formats[0])
+		//runtime.Gosched()
+		require.NoError(t, err)
+		//runtime.Gosched()
+		require.Equal(t, expect, current.Dig("k8s_ns").AsString())
+		//runtime.Gosched()
+		insaneJSON.Release(current)
+	}
+
+	close(stop)
 }
 
 func TestThrottle(t *testing.T) {
@@ -100,7 +171,15 @@ func TestThrottle(t *testing.T) {
 	workTime := config.BucketInterval_ * time.Duration(iterations)
 
 	tconf := testConfig{t, config, eventsTotal, workTime}
-	tconf.runPipeline(t)
+	outEvents := tconf.runPipeline()
+
+	if !assert.Equal(t, eventsTotal, outEvents) {
+		for k, m := range limiters {
+			for s, l := range m {
+				fmt.Printf("%s: %s: %+v\n", k, s, l.buckets)
+			}
+		}
+	}
 }
 
 func TestSizeThrottle(t *testing.T) {
@@ -137,7 +216,9 @@ func TestSizeThrottle(t *testing.T) {
 	workTime := config.BucketInterval_ * time.Duration(iterations)
 
 	tconf := testConfig{t, config, eventsTotal, workTime}
-	tconf.runPipeline(t)
+	outEvents := tconf.runPipeline()
+
+	assert.Equal(t, eventsTotal, outEvents)
 }
 
 func TestMixedThrottle(t *testing.T) {
@@ -172,5 +253,7 @@ func TestMixedThrottle(t *testing.T) {
 	workTime := config.BucketInterval_ * time.Duration(iterations)
 
 	tconf := testConfig{t, config, eventsTotal, workTime}
-	tconf.runPipeline(t)
+	outEvents := tconf.runPipeline()
+
+	assert.Equal(t, eventsTotal, outEvents)
 }
