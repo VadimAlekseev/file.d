@@ -19,6 +19,7 @@ type InputPlugin interface {
 	Start(config AnyConfig, params *InputPluginParams)
 	Stop()
 	Commit(*Event)
+	PassEvent(event *Event) bool
 }
 
 type ActionPlugin interface {
@@ -103,9 +104,9 @@ type OutputPluginInfo struct {
 	*PluginRuntimeInfo
 }
 
-type AnyPlugin interface{}
+type AnyPlugin any
 
-type AnyConfig interface{}
+type AnyConfig any
 
 type PluginFactory func() (AnyPlugin, AnyConfig)
 
