@@ -186,7 +186,7 @@ jobs:
         run: docker exec kafka_file_kafka_1 kafka-topics.sh --bootstrap-server kafka:9092 --create --topic quickstart5 --partitions 4
 
       - name: Run e2e tests
-        run: go test ./cmd/... -coverprofile=profile_e2e.out -covermode=atomic --tags=e2e_new -count=1 -timeout=3m
+        run: go test ./cmd/... -coverprofile=profile_e2e.out -covermode=atomic -coverpkg=./... --tags=e2e_new -count=1 -timeout=3m
 
       - name: Upload artifact
         uses: actions/upload-artifact@v3
