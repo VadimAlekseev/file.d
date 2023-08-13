@@ -10,7 +10,10 @@ jobs:
     permissions:
       packages: write
       contents: read
-
+    strategy:
+      fail-fast: false
+      matrix:
+        app_image: [ '', 'ubuntu20.04', 'ubuntu22.04' ]
     steps:
       - uses: actions/checkout@v3
 
@@ -35,6 +38,7 @@ jobs:
         uses: docker/build-push-action@v4
         with:
           push: true
-          build-args:
-            - VERSION=${{ steps.set-version.outputs.VERSION }}
-          tags: ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }}:${{ steps.set-version.outputs.VERSION }}
+          build-args: |
+            VERSION=${{ steps.set-version.outputs.VERSION }}
+            APP_IMAGE=${{ matrix.app_image }}
+          tags: ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }}:${{ steps.set-version.outputs.VERSION }}-${{ matrix.app_image }}
