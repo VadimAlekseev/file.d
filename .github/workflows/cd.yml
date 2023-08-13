@@ -10,7 +10,10 @@ jobs:
     permissions:
       packages: write
       contents: read
-
+    strategy:
+      fail-fast: false
+      matrix:
+        app_image: [ '', 'ubuntu:20.04', 'ubuntu:22.04' ]
     steps:
       - uses: actions/checkout@v3
 
@@ -29,12 +32,19 @@ jobs:
         run: |
           VERSION=${GITHUB_REF/refs\/tags\//}
           echo "VERSION=${VERSION}" >> $GITHUB_OUTPUT
+          
+          # if app_image == '' then '' else '-<app_image>'
+          IMAGE_TAG_SUFFIX=$([ ${{ matrix.app_image }} == '' ] && echo '' || echo -${{ matrix.app_image }})
+          # replace : with ''
+          IMAGE_TAG_SUFFIX=${IMAGE_TAG_SUFFIX/:/}
+          echo "IMAGE_TAG_SUFFIX=${IMAGE_TAG_SUFFIX}" >> $GITHUB_OUTPUT
 
       - name: Build and push
         id: docker-build
         uses: docker/build-push-action@v4
         with:
           push: true
-          build-args:
-            - VERSION=${{ steps.set-version.outputs.VERSION }}
-          tags: ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }}:${{ steps.set-version.outputs.VERSION }}
+          build-args: |
+            VERSION=${{ steps.set-version.outputs.VERSION }}
+            APP_IMAGE=${{ matrix.app_image }}
+          tags: ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }}:${{ steps.set-version.outputs.VERSION }}${{ steps.set-version.outputs.IMAGE_TAG_SUFFIX }}
