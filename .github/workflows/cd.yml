@@ -15,7 +15,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        app_image: [ '', 'ubuntu:20.04', 'ubuntu:22.04' ]
+        image:
+          - name: 'ubuntu:18.04'
+            suffix: '-ubuntu18.04'
+          - name: 'ubuntu:20.04'
+            suffix: '-ubuntu20.04'
+          - name: 'ubuntu:22.04'
+            suffix: '-ubuntu22.04'
+          - name: 'ubuntu:latest'
+            suffix: ''
     steps:
       - uses: actions/checkout@v3
 
@@ -49,4 +57,4 @@ jobs:
           build-args: |
             VERSION=${{ steps.set-version.outputs.VERSION }}
             APP_IMAGE=${{ matrix.app_image }}
-          tags: ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }}:${{ steps.set-version.outputs.VERSION }}${{ steps.set-version.outputs.IMAGE_TAG_SUFFIX }}
+          tags: ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }}:${{ steps.set-version.outputs.VERSION }}${{ matrix.image.suffix }}

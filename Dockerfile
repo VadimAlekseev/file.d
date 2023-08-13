@@ -6,9 +6,6 @@ FROM --platform=$BUILDPLATFORM golang:1.21-alpine AS build
 ARG VERSION
 ARG BUILD_TIME
 
-RUN apk update
-RUN apk add git
-
 WORKDIR /file.d
 
 COPY go.mod go.sum ./
