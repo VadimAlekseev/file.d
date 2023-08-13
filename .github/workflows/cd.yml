@@ -3,6 +3,8 @@ name: CD
 on:
   release:
     types: published
+  pull_request:
+    branches: [ master ]
 
 jobs:
   build:
@@ -40,6 +42,12 @@ jobs:
         run: |
           VERSION=${GITHUB_REF/refs\/tags\//}
           echo "VERSION=${VERSION}" >> $GITHUB_OUTPUT
+          
+          # if app_image == '' then '' else '-<app_image>'
+          IMAGE_TAG_SUFFIX=$([ ${{ matrix.app_image }} == '' ] && echo '' || echo -${{ matrix.app_image }})
+          # replace : with ''
+          IMAGE_TAG_SUFFIX=${IMAGE_TAG_SUFFIX/:/}
+          echo "IMAGE_TAG_SUFFIX=${IMAGE_TAG_SUFFIX}" >> $GITHUB_OUTPUT
 
       - name: Build and push
         id: docker-build
