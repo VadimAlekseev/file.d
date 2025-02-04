@@ -12,7 +12,6 @@ import (
 
 	"github.com/golang/mock/gomock"
 	"github.com/minio/minio-go"
-	"github.com/ozontech/file.d/cfg"
 	"github.com/ozontech/file.d/logger"
 	"github.com/ozontech/file.d/pipeline"
 	"github.com/ozontech/file.d/plugin/input/fake"
@@ -22,6 +21,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/assert"
 	"go.uber.org/atomic"
+	"go.uber.org/zap"
 	"golang.org/x/net/context"
 )
 
@@ -159,9 +159,7 @@ func TestStart(t *testing.T) {
 	defer test.ClearDir(t, dir)
 	test.ClearDir(t, config.DefaultBucket)
 	defer test.ClearDir(t, config.DefaultBucket)
-
-	err := cfg.Parse(config, map[string]int{"gomaxprocs": 1, "capacity": 64})
-	assert.NoError(t, err)
+	test.NewConfig(config, map[string]int{"gomaxprocs": 1, "capacity": 64})
 
 	p := newPipeline(t, config, func(cfg *Config) (ObjectStoreClient, map[string]ObjectStoreClient, error) {
 		return s3MockClient, map[string]ObjectStoreClient{
@@ -338,9 +336,7 @@ func TestStartWithMultiBuckets(t *testing.T) {
 	defer test.ClearDir(t, buckets[2])
 	test.ClearDir(t, dynamicBucket)
 	defer test.ClearDir(t, dynamicBucket)
-
-	err := cfg.Parse(config, map[string]int{"gomaxprocs": 1, "capacity": 64})
-	assert.NoError(t, err)
+	test.NewConfig(config, map[string]int{"gomaxprocs": 1, "capacity": 64})
 
 	p := newPipeline(t, config, func(cfg *Config) (ObjectStoreClient, map[string]ObjectStoreClient, error) {
 		return s3MockClient, map[string]ObjectStoreClient{
@@ -398,13 +394,14 @@ func newPipeline(t *testing.T, configOutput *Config, objStoreF objStoreFactory) 
 		Capacity:            4096,
 		MaintenanceInterval: time.Second * 10,
 		// MaintenanceInterval: time.Second * 100000,
-		AntispamThreshold: 0,
-		AvgEventSize:      2048,
-		StreamField:       "stream",
-		Decoder:           "json",
+		AntispamThreshold:  0,
+		AvgEventSize:       2048,
+		StreamField:        "stream",
+		Decoder:            "json",
+		MetricHoldDuration: pipeline.DefaultMetricHoldDuration,
 	}
 
-	p := pipeline.New("test_pipeline", settings, prometheus.NewRegistry())
+	p := pipeline.New("test_pipeline", settings, prometheus.NewRegistry(), zap.NewNop())
 	p.DisableParallelism()
 	p.EnableEventLog()
 
@@ -451,9 +448,8 @@ func TestStartPanic(t *testing.T) {
 	defer test.ClearDir(t, dir)
 	test.ClearDir(t, config.DefaultBucket)
 	defer test.ClearDir(t, config.DefaultBucket)
+	test.NewConfig(config, map[string]int{"gomaxprocs": 1, "capacity": 64})
 
-	err := cfg.Parse(config, map[string]int{"gomaxprocs": 1, "capacity": 64})
-	assert.NoError(t, err)
 	p := newPipeline(t, config, func(cfg *Config) (ObjectStoreClient, map[string]ObjectStoreClient, error) {
 		return nil, nil, nil
 	})
@@ -530,8 +526,7 @@ func TestStartWithSendProblems(t *testing.T) {
 	defer test.ClearDir(t, dir)
 	test.ClearDir(t, fmt.Sprintf("%s/", config.DefaultBucket))
 	defer test.ClearDir(t, config.DefaultBucket)
-	err := cfg.Parse(config, map[string]int{"gomaxprocs": 1, "capacity": 64})
-	assert.NoError(t, err)
+	test.NewConfig(config, map[string]int{"gomaxprocs": 1, "capacity": 64})
 	p := newPipeline(t, config, func(cfg *Config) (ObjectStoreClient, map[string]ObjectStoreClient, error) {
 		return s3MockClient, map[string]ObjectStoreClient{
 			bucketName: s3MockClient,
@@ -620,7 +615,6 @@ func TestStartWithSendProblems(t *testing.T) {
 	scanner := bufio.NewScanner(f)
 	lineCounter := 0
 	for scanner.Scan() {
-		fmt.Println(scanner.Text())
 		lineCounter++
 	}
 	assert.GreaterOrEqual(t, lineCounter, 3)

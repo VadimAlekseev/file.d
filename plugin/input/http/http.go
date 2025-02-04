@@ -1,15 +1,24 @@
 package http
 
 import (
+	"crypto/sha1"
+	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
+	"strings"
 	"sync"
+	"time"
 
+	"github.com/google/uuid"
+	"github.com/klauspost/compress/gzip"
+	"github.com/ozontech/file.d/cfg"
 	"github.com/ozontech/file.d/fd"
-	"github.com/ozontech/file.d/logger"
 	"github.com/ozontech/file.d/metric"
 	"github.com/ozontech/file.d/pipeline"
-	"github.com/ozontech/file.d/tls"
+	"github.com/ozontech/file.d/pipeline/metadata"
+	"github.com/ozontech/file.d/xtls"
 	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/zap"
 )
@@ -60,7 +69,7 @@ pipelines:
 ```
 
 Setup:
-```
+```bash
 # run server.
 # config.yaml should contains yaml config above.
 go run ./cmd/file.d --config=config.yaml
@@ -70,9 +79,7 @@ curl "localhost:9200/_bulk" -H 'Content-Type: application/json' -d \
 '{"index":{"_index":"index-main","_type":"span"}}
 {"message": "hello", "kind": "normal"}
 '
-
-##
-
+```
 }*/
 
 const (
@@ -80,21 +87,41 @@ const (
 )
 
 type Plugin struct {
-	config     *Config
+	mu sync.Mutex
+
+	server            *http.Server
+	config            *Config
+	nameByBearerToken map[string]string
+	logger            *zap.Logger
+
 	params     *pipeline.InputPluginParams
-	readBuffs  *sync.Pool
-	eventBuffs *sync.Pool
 	controller pipeline.InputPluginController
-	server     *http.Server
-	sourceIDs  []pipeline.SourceID
-	sourceSeq  pipeline.SourceID
-	mu         *sync.Mutex
-	logger     *zap.SugaredLogger
+
+	sourceIDs []pipeline.SourceID
+	sourceSeq pipeline.SourceID
+
+	gzipReaderPool sync.Pool
+	readBuffs      sync.Pool
+	eventBuffs     sync.Pool
 
 	// plugin metrics
 
-	httpErrorMetric *prometheus.CounterVec
+	successfulAuthTotal   map[string]prometheus.Counter
+	failedAuthTotal       prometheus.Counter
+	errorsTotal           prometheus.Counter
+	bulkRequestsDoneTotal prometheus.Counter
+	requestsInProgress    prometheus.Gauge
+	processBulkSeconds    prometheus.Observer
+
+	metaTemplater *metadata.MetaTemplater
 }
+
+type EmulateMode byte
+
+const (
+	EmulateModeNo EmulateMode = iota
+	EmulateModeElasticSearch
+)
 
 // ! config-params
 // ^ config-params
@@ -106,7 +133,8 @@ type Config struct {
 	// > @3@4@5@6
 	// >
 	// > Which protocol to emulate.
-	EmulateMode string `json:"emulate_mode" default:"no" options:"no|elasticsearch"` // *
+	EmulateMode  string `json:"emulate_mode" default:"no" options:"no|elasticsearch"` // *
+	EmulateMode_ EmulateMode
 	// > @3@4@5@6
 	// >
 	// > CA certificate in PEM encoding. This can be a path or the content of the certificate.
@@ -117,6 +145,121 @@ type Config struct {
 	// > CA private key in PEM encoding. This can be a path or the content of the key.
 	// > If both ca_cert and private_key are set, the server starts accepting connections in TLS mode.
 	PrivateKey string `json:"private_key" default:""` // *
+
+	// > @3@4@5@6
+	// >
+	// > Auth config.
+	// > Disabled by default.
+	// > See AuthConfig for details.
+	// > You can use 'warn' log level for logging authorizations.
+	Auth AuthConfig `json:"auth" child:"true"` // *
+
+	// > @3@4@5@6
+	// >
+	// > Meta params
+	// >
+	// > Add meta information to an event (look at Meta params)
+	// > Use [go-template](https://pkg.go.dev/text/template) syntax
+	// >
+	// > Example: ```user_agent: '{{ index (index .request.Header "User-Agent") 0}}'```
+	Meta cfg.MetaTemplates `json:"meta"` // *
+
+	// > @3@4@5@6
+	// >
+	// > CORS config.
+	// > Allowed origins support only one wildcard symbol. `http://*.example.com` - valid, `http://*.example.*.com` - invalid.
+	// > See CORSConfig for details.
+	CORS CORSConfig `json:"cors" child:"true"` // *
+}
+
+type AuthStrategy byte
+
+const (
+	StrategyDisabled AuthStrategy = iota
+	StrategyBasic
+	StrategyBearer
+)
+
+// ! config-params
+// ^ config-params
+type AuthConfig struct {
+	// > @3@4@5@6
+	// >
+	// > Override default Authorization header
+	Header string `json:"header" default:"Authorization"` // *
+
+	// > @3@4@5@6
+	// >
+	// > AuthStrategy.Strategy describes strategy to use.
+	Strategy  string `json:"strategy" default:"disabled" options:"disabled|basic|bearer"` // *
+	Strategy_ AuthStrategy
+	// > @3@4@5@6
+	// >
+	// > AuthStrategy.Secrets describes secrets in key-value format.
+	// > If the `strategy` is basic, then the key is the login, the value is the password.
+	// > If the `strategy` is bearer, then the key is the name, the value is the Bearer token.
+	// > Key uses in the http_input_total metric.
+	Secrets map[string]string `json:"secrets"` // *
+}
+
+type originDomain struct {
+	domain string
+	prefix string
+	suffix string
+}
+
+type CORSConfig struct {
+	AllowedOrigins []string `json:"allowed_origins"`
+	DefaultOrigin  string   `json:"default_origin"  default:"*"`
+	AllowedHeaders []string `json:"allowed_headers"`
+	ExposedHeaders []string `json:"exposed_headers"`
+
+	allowedOriginsDomains []originDomain
+	allowedOriginsAll     bool
+}
+
+func (c *CORSConfig) getAllowedByOrigin(origin string) string {
+	if c.allowedOriginsAll {
+		return origin
+	}
+
+	for _, ao := range c.allowedOriginsDomains {
+		if ao.domain != "" && origin == ao.domain {
+			return origin
+		}
+
+		pslen := len(ao.prefix) + len(ao.suffix)
+		if pslen > 0 && len(origin) > pslen && strings.HasPrefix(origin, ao.prefix) && strings.HasSuffix(origin, ao.suffix) {
+			return origin
+		}
+	}
+
+	return c.DefaultOrigin
+}
+
+func (c *CORSConfig) prepareAllowedOrigins() error {
+	for _, ao := range c.AllowedOrigins {
+		ao = strings.ToLower(ao)
+		if ao == "*" {
+			c.allowedOriginsAll = true
+			c.allowedOriginsDomains = nil
+			break
+		}
+		if wildcard := strings.IndexByte(ao, '*'); wildcard != -1 {
+			if strings.Contains(ao[wildcard+1:], "*") {
+				return fmt.Errorf("invalid origin %q, only one wildcard per origin is allowed", ao)
+			}
+			c.allowedOriginsDomains = append(c.allowedOriginsDomains, originDomain{
+				prefix: ao[:wildcard],
+				suffix: ao[wildcard+1:],
+			})
+			continue
+		}
+		c.allowedOriginsDomains = append(c.allowedOriginsDomains, originDomain{
+			domain: ao,
+		})
+	}
+	return nil
 }
 
 func init() {
@@ -133,24 +276,33 @@ func Factory() (pipeline.AnyPlugin, pipeline.AnyConfig) {
 func (p *Plugin) Start(config pipeline.AnyConfig, params *pipeline.InputPluginParams) {
 	p.config = config.(*Config)
 	p.params = params
-	p.logger = params.Logger
+	p.logger = params.Logger.Desugar()
 	p.registerMetrics(params.MetricCtl)
+	p.metaTemplater = metadata.NewMetaTemplater(
+		p.config.Meta,
+		p.logger,
+		params.PipelineSettings.MetaCacheSize,
+	)
 
-	p.readBuffs = &sync.Pool{}
-	p.eventBuffs = &sync.Pool{}
-	p.mu = &sync.Mutex{}
+	if p.config.Auth.Strategy_ == StrategyBearer {
+		p.nameByBearerToken = make(map[string]string, len(p.config.Auth.Secrets))
+		for name, token := range p.config.Auth.Secrets {
+			p.nameByBearerToken[token] = name
+		}
+	}
+
+	if err := p.config.CORS.prepareAllowedOrigins(); err != nil {
+		p.logger.Fatal("failed to prepare allowed origins", zap.Error(err))
+	}
+
 	p.controller = params.Controller
 	p.controller.DisableStreams()
 	p.sourceIDs = make([]pipeline.SourceID, 0)
 
-	mux := http.NewServeMux()
-	switch p.config.EmulateMode {
-	case "elasticsearch":
-		p.elasticsearch(mux)
-	case "no":
-		mux.HandleFunc("/", p.serve)
+	p.server = &http.Server{
+		Addr:    p.config.Address,
+		Handler: http.Handler(p),
 	}
-	p.server = &http.Server{Addr: p.config.Address, Handler: mux}
 
 	if p.config.Address != "off" {
 		go p.listenHTTP()
@@ -158,13 +310,25 @@ func (p *Plugin) Start(config pipeline.AnyConfig, params *pipeline.InputPluginPa
 }
 
 func (p *Plugin) registerMetrics(ctl *metric.Ctl) {
-	p.httpErrorMetric = ctl.RegisterCounter("input_http_errors", "Total http errors")
+	p.bulkRequestsDoneTotal = ctl.RegisterCounter("bulk_requests_done_total", "")
+	p.requestsInProgress = ctl.RegisterGauge("requests_in_progress", "")
+	p.processBulkSeconds = ctl.RegisterHistogram("process_bulk_seconds", "", metric.SecondsBucketsDetailed)
+	p.errorsTotal = ctl.RegisterCounter("input_http_errors", "Total http errors")
+
+	if p.config.Auth.Strategy_ != StrategyDisabled {
+		httpAuthTotal := ctl.RegisterCounterVec("http_auth_success_total", "", "secret_name")
+		p.successfulAuthTotal = make(map[string]prometheus.Counter, len(p.config.Auth.Secrets))
+		for key := range p.config.Auth.Secrets {
+			p.successfulAuthTotal[key] = httpAuthTotal.WithLabelValues(key)
+		}
+		p.failedAuthTotal = ctl.RegisterCounter("http_auth_fails_total", "")
+	}
 }
 
 func (p *Plugin) listenHTTP() {
 	var err error
 	if p.config.CACert != "" || p.config.PrivateKey != "" {
-		tlsBuilder := tls.NewConfigBuilder()
+		tlsBuilder := xtls.NewConfigBuilder()
 		err = tlsBuilder.AppendX509KeyPair(p.config.CACert, p.config.PrivateKey)
 		if err == nil {
 			p.server.TLSConfig = tlsBuilder.Build()
@@ -175,7 +339,7 @@ func (p *Plugin) listenHTTP() {
 	}
 
 	if err != nil {
-		logger.Fatalf("input plugin http listening error address=%q: %s", p.config.Address, err.Error())
+		p.logger.Fatal("input plugin http listening error", zap.String("addr", p.config.Address), zap.Error(err))
 	}
 }
 
@@ -214,46 +378,174 @@ func (p *Plugin) putSourceID(x pipeline.SourceID) {
 	p.mu.Unlock()
 }
 
-func (p *Plugin) serve(w http.ResponseWriter, r *http.Request) {
+func (p *Plugin) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	allowOrigin := p.config.CORS.getAllowedByOrigin(r.Header.Get("Origin"))
+	w.Header().Set(
+		"Access-Control-Allow-Origin",
+		allowOrigin,
+	)
+
+	if len(p.config.CORS.AllowedHeaders) > 0 {
+		w.Header().Set(
+			"Access-Control-Allow-Headers",
+			strings.Join(p.config.CORS.AllowedHeaders, ","),
+		)
+	}
+
+	if len(p.config.CORS.ExposedHeaders) > 0 {
+		w.Header().Set(
+			"Access-Control-Exposed-Headers",
+			strings.Join(p.config.CORS.ExposedHeaders, ","),
+		)
+	}
+
+	w.Header().Set("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
+
+	if r.Method == http.MethodOptions {
+		return
+	}
+
+	ok, login := p.auth(r)
+
+	if !ok {
+		p.failedAuthTotal.Inc()
+		p.errorsTotal.Inc()
+		p.logger.Warn("auth failed",
+			zap.String("user_agent", r.UserAgent()),
+			zap.Any("headers", r.Header),
+			zap.String("remote_addr", r.RemoteAddr),
+		)
+		http.Error(w, "auth failed", http.StatusUnauthorized)
+		return
+	}
+
+	var metadataInfo metadata.MetaData
+	var err error
+	if len(p.config.Meta) > 0 {
+		metadataInfo, err = p.metaTemplater.Render(newMetaInformation(login, getUserIP(r), r))
+		if err != nil {
+			p.logger.Error("cannot parse meta info", zap.Error(err))
+		}
+	}
+
+	path := r.URL.Path
+	switch p.config.EmulateMode_ {
+	case EmulateModeElasticSearch:
+		w.Header().Add("Content-Type", "application/json")
+		w.Header().Set("X-Elastic-Product", "Elasticsearch")
+
+		switch path {
+		case "/_bulk":
+			p.serveBulk(w, r, metadataInfo)
+			return
+		case "/":
+			p.serveElasticsearchInfo(w, r)
+			return
+		case "/_xpack":
+			p.serveElasticsearchXPack(w, r)
+			return
+		case "/_license":
+			p.serveElasticsearchLicense(w, r)
+			return
+		}
+
+		if strings.HasPrefix(path, "/_ilm/policy") {
+			_, _ = w.Write(empty)
+			return
+		}
+		if strings.HasPrefix(path, "/_index_template") {
+			_, _ = w.Write(empty)
+			return
+		}
+		if strings.HasPrefix(path, "/_template") {
+			_, _ = w.Write(empty)
+			return
+		}
+		if strings.HasPrefix(path, "/_ingest") {
+			_, _ = w.Write(empty)
+			return
+		}
+		if strings.HasPrefix(path, "/_nodes") {
+			_, _ = w.Write(empty)
+			return
+		}
+
+		p.logger.Error("unknown elasticsearch request", zap.String("uri", r.RequestURI), zap.String("method", r.Method))
+		return
+	case EmulateModeNo:
+		p.serveBulk(w, r, metadataInfo)
+		return
+	default:
+		panic("unreachable")
+	}
+}
+
+func (p *Plugin) serveBulk(w http.ResponseWriter, r *http.Request, meta metadata.MetaData) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "", http.StatusMethodNotAllowed)
+		return
+	}
+
+	start := time.Now()
+	p.requestsInProgress.Inc()
+
+	reader := io.Reader(r.Body)
+	if r.Header.Get("Content-Encoding") == "gzip" {
+		zr, err := p.acquireGzipReader(reader)
+		if err != nil {
+			p.errorsTotal.Inc()
+			p.logger.Error("can't read gzipped body", zap.Error(err))
+			http.Error(w, "can't read gzipped body", http.StatusBadRequest)
+			return
+		}
+		defer p.putGzipReader(zr)
+		reader = zr
+	}
+
+	if err := p.processBulk(reader, meta); err != nil {
+		p.errorsTotal.Inc()
+		p.logger.Error("http input read error", zap.Error(err))
+		http.Error(w, "http input read error", http.StatusBadRequest)
+		return
+	}
+
+	_, _ = w.Write(result)
+
+	p.requestsInProgress.Dec()
+	p.bulkRequestsDoneTotal.Inc()
+	p.processBulkSeconds.Observe(time.Since(start).Seconds())
+}
+
+func (p *Plugin) processBulk(r io.Reader, meta metadata.MetaData) error {
 	readBuff := p.newReadBuff()
 	eventBuff := p.newEventBuffs()
+	defer p.readBuffs.Put(&readBuff)
+	defer p.eventBuffs.Put(&eventBuff)
 
 	sourceID := p.getSourceID()
 	defer p.putSourceID(sourceID)
 
 	for {
-		n, err := r.Body.Read(readBuff)
+		n, err := r.Read(readBuff)
 		if n == 0 && err == io.EOF {
 			break
 		}
 
 		if err != nil && err != io.EOF {
-			p.httpErrorMetric.WithLabelValues().Inc()
-			logger.Errorf("http input read error: %s", err.Error())
-			break
+			return err
 		}
 
-		eventBuff = p.processChunk(sourceID, readBuff[:n], eventBuff, false)
+		eventBuff = p.processChunk(sourceID, readBuff[:n], eventBuff, false, meta)
 	}
 
 	if len(eventBuff) > 0 {
-		eventBuff = p.processChunk(sourceID, readBuff[:0], eventBuff, true)
+		eventBuff = p.processChunk(sourceID, readBuff[:0], eventBuff, true, meta)
 	}
 
-	_ = r.Body.Close()
-
-	// https://staticcheck.io/docs/checks/#SA6002
-	p.readBuffs.Put(&readBuff)
-	p.eventBuffs.Put(&eventBuff)
-
-	_, err := w.Write(result)
-	if err != nil {
-		p.httpErrorMetric.WithLabelValues().Inc()
-		logger.Errorf("can't write response: %s", err.Error())
-	}
+	return nil
 }
 
-func (p *Plugin) processChunk(sourceID pipeline.SourceID, readBuff []byte, eventBuff []byte, isLastChunk bool) []byte {
+func (p *Plugin) processChunk(sourceID pipeline.SourceID, readBuff []byte, eventBuff []byte, isLastChunk bool, meta metadata.MetaData) []byte {
 	pos := 0   // current position
 	nlPos := 0 // new line position
 	for pos < len(readBuff) {
@@ -264,10 +556,10 @@ func (p *Plugin) processChunk(sourceID pipeline.SourceID, readBuff []byte, event
 
 		if len(eventBuff) != 0 {
 			eventBuff = append(eventBuff, readBuff[nlPos:pos]...)
-			_ = p.controller.In(sourceID, "http", int64(pos), eventBuff, true)
+			_ = p.controller.In(sourceID, "http", pipeline.NewOffsets(int64(pos), nil), eventBuff, true, meta)
 			eventBuff = eventBuff[:0]
 		} else {
-			_ = p.controller.In(sourceID, "http", int64(pos), readBuff[nlPos:pos], true)
+			_ = p.controller.In(sourceID, "http", pipeline.NewOffsets(int64(pos), nil), readBuff[nlPos:pos], true, meta)
 		}
 
 		pos++
@@ -276,7 +568,7 @@ func (p *Plugin) processChunk(sourceID pipeline.SourceID, readBuff []byte, event
 
 	if isLastChunk {
 		// flush buffers if we can't find the newline character
-		_ = p.controller.In(sourceID, "http", int64(pos), append(eventBuff, readBuff[nlPos:]...), true)
+		_ = p.controller.In(sourceID, "http", pipeline.NewOffsets(int64(pos), nil), append(eventBuff, readBuff[nlPos:]...), true, meta)
 		eventBuff = eventBuff[:0]
 	} else {
 		eventBuff = append(eventBuff, readBuff[nlPos:]...)
@@ -296,3 +588,139 @@ func (p *Plugin) Commit(_ *pipeline.Event) {
 func (p *Plugin) PassEvent(_ *pipeline.Event) bool {
 	return true
 }
+
+func (p *Plugin) auth(req *http.Request) (bool, string) {
+	if p.config.Auth.Strategy_ == StrategyDisabled {
+		return true, ""
+	}
+
+	var secretName string
+	var ok bool
+	switch p.config.Auth.Strategy_ {
+	case StrategyBasic:
+		secretName, ok = p.authBasic(req)
+	case StrategyBearer:
+		secretName, ok = p.authBearer(req)
+	default:
+		panic("unreachable")
+	}
+	if !ok {
+		return false, ""
+	}
+	p.successfulAuthTotal[secretName].Inc()
+	return true, secretName
+}
+
+func (p *Plugin) authBasic(req *http.Request) (string, bool) {
+	req.Header.Get(p.config.Auth.Header)
+	req.Header.Set("Authorization", req.Header.Get(p.config.Auth.Header))
+
+	username, password, ok := req.BasicAuth()
+	if !ok {
+		return username, false
+	}
+	return username, p.config.Auth.Secrets[username] == password
+}
+
+func (p *Plugin) authBearer(req *http.Request) (string, bool) {
+	authHeader := req.Header.Get(p.config.Auth.Header)
+	const prefix = "Bearer "
+	if !strings.HasPrefix(authHeader, prefix) {
+		return "", false
+	}
+	token := authHeader[len(prefix):]
+	name, ok := p.nameByBearerToken[token]
+	return name, ok
+}
+
+func (p *Plugin) acquireGzipReader(r io.Reader) (*gzip.Reader, error) {
+	anyReader := p.gzipReaderPool.Get()
+	if anyReader == nil {
+		return gzip.NewReader(r)
+	}
+	gzReader := anyReader.(*gzip.Reader)
+	err := gzReader.Reset(r)
+	return gzReader, err
+}
+
+func (p *Plugin) putGzipReader(reader *gzip.Reader) {
+	_ = reader.Close()
+	p.gzipReaderPool.Put(reader)
+}
+
+func getUserIP(r *http.Request) net.IP {
+	var userIP string
+	switch {
+	case r.Header.Get("CF-Connecting-IP") != "":
+		userIP = r.Header.Get("CF-Connecting-IP")
+	case r.Header.Get("X-Forwarded-For") != "":
+		userIP = r.Header.Get("X-Forwarded-For")
+	case r.Header.Get("X-Real-IP") != "":
+		userIP = r.Header.Get("X-Real-IP")
+	default:
+		userIP = r.RemoteAddr
+		if strings.Contains(userIP, ":") {
+			return net.ParseIP(strings.Split(userIP, ":")[0])
+		}
+	}
+	return net.ParseIP(userIP)
+}
+
+type metaInformation struct {
+	login      string
+	remoteAddr net.IP
+	request    *http.Request
+	params     url.Values
+}
+
+func newMetaInformation(login string, ip net.IP, r *http.Request) metaInformation {
+	return metaInformation{
+		login:      login,
+		remoteAddr: ip,
+		request:    r,
+		params:     r.URL.Query(),
+	}
+}
+
+func (m metaInformation) GetData() map[string]any {
+	contentLength := fmt.Sprintf("%d", m.request.ContentLength)
+	encodedParams := m.params.Encode()
+	remoteAddress := m.remoteAddr
+	result := fmt.Sprintf("%s|%s|%s", contentLength, encodedParams, remoteAddress)
+	requestUuid, _ := stringToUUID(result)
+
+	return map[string]any{
+		"login":        m.login,
+		"remote_addr":  m.remoteAddr,
+		"request":      m.request,
+		"params":       m.params,
+		"request_uuid": requestUuid.String(),
+	}
+}
+
+func stringToUUID(input string) (uuid.UUID, error) {
+	hash := sha1.New()
+	_, err := hash.Write([]byte(input))
+	if err != nil {
+		return uuid.UUID{}, err
+	}
+
+	hashBytes := hash.Sum(nil)
+
+	var u uuid.UUID
+	copy(u[:], hashBytes[:16])
+
+	return u, nil
+}
+
+/*{ meta-params
+**`login`**
+
+**`remote_addr`**  *`net.IP`*
+
+**`request`**  *`http.Request`*
+
+**`params`**  *`url.Values`*
+
+**`request_uuid`**  *`string`*
+}*/

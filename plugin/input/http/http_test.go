@@ -2,42 +2,35 @@ package http
 
 import (
 	"bytes"
+	"compress/gzip"
+	"encoding/base64"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
+	"reflect"
 	"runtime"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
-
 	"github.com/ozontech/file.d/cfg"
 	"github.com/ozontech/file.d/pipeline"
 	"github.com/ozontech/file.d/test"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
-func getInputInfo() *pipeline.InputPluginInfo {
-	input, _ := Factory()
-	return &pipeline.InputPluginInfo{
-		PluginStaticInfo: &pipeline.PluginStaticInfo{
-			Type:    "",
-			Factory: nil,
-			Config:  &Config{Address: "off"},
-		},
-		PluginRuntimeInfo: &pipeline.PluginRuntimeInfo{
-			Plugin: input,
-			ID:     "",
-		},
+func getInputInfo(config *Config) *pipeline.InputPluginInfo {
+	test.NewConfig(config, map[string]int{"gomaxprocs": runtime.GOMAXPROCS(0)})
+	config.Meta = cfg.MetaTemplates{
+		"remote_addr": "{{ .remote_addr }}",
+		"method":      `{{ .request.Method }}`,
+		"login":       "{{ .login }}",
 	}
-}
-
-func getInputInfoWithAddr() *pipeline.InputPluginInfo {
-	config := &Config{Address: ":9200"}
-	_ = cfg.Parse(config, map[string]int{"gomaxprocs": runtime.GOMAXPROCS(0)})
 	input, _ := Factory()
 	return &pipeline.InputPluginInfo{
 		PluginStaticInfo: &pipeline.PluginStaticInfo{
@@ -53,8 +46,9 @@ func getInputInfoWithAddr() *pipeline.InputPluginInfo {
 }
 
 func TestProcessChunksMany(t *testing.T) {
+	t.Parallel()
 	p, _, output := test.NewPipelineMock(nil, "passive")
-	p.SetInput(getInputInfo())
+	p.SetInput(getInputInfo(&Config{Address: ":0"}))
 	input := p.GetInput().(*Plugin)
 	p.Start()
 
@@ -71,7 +65,7 @@ func TestProcessChunksMany(t *testing.T) {
 {"a":"2"}
 {"a":"3"}`)
 	eventBuff := make([]byte, 0)
-	eventBuff = input.processChunk(0, chunk, eventBuff, true)
+	eventBuff = input.processChunk(0, chunk, eventBuff, true, nil)
 
 	wg.Wait()
 	p.Stop()
@@ -84,8 +78,9 @@ func TestProcessChunksMany(t *testing.T) {
 }
 
 func TestProcessChunksEventBuff(t *testing.T) {
+	t.Parallel()
 	p, _, output := test.NewPipelineMock(nil, "passive")
-	p.SetInput(getInputInfo())
+	p.SetInput(getInputInfo(&Config{Address: ":0"}))
 	input := p.GetInput().(*Plugin)
 	p.Start()
 
@@ -102,7 +97,7 @@ func TestProcessChunksEventBuff(t *testing.T) {
 {"a":"2"}
 {"a":"3"}`)
 	eventBuff := make([]byte, 0)
-	eventBuff = input.processChunk(0, chunk, eventBuff, false)
+	eventBuff = input.processChunk(0, chunk, eventBuff, false, nil)
 
 	wg.Wait()
 	p.Stop()
@@ -114,8 +109,9 @@ func TestProcessChunksEventBuff(t *testing.T) {
 }
 
 func TestProcessChunksContinue(t *testing.T) {
+	t.Parallel()
 	p, _, output := test.NewPipelineMock(nil, "passive")
-	p.SetInput(getInputInfo())
+	p.SetInput(getInputInfo(&Config{Address: ":0"}))
 	input := p.GetInput().(*Plugin)
 	p.Start()
 
@@ -133,7 +129,7 @@ func TestProcessChunksContinue(t *testing.T) {
 {"a":"3"}
 `)
 	eventBuff := []byte(`{"a":`)
-	eventBuff = input.processChunk(0, chunk, eventBuff, false)
+	eventBuff = input.processChunk(0, chunk, eventBuff, false, nil)
 
 	wg.Wait()
 	p.Stop()
@@ -146,8 +142,9 @@ func TestProcessChunksContinue(t *testing.T) {
 }
 
 func TestProcessChunksContinueMany(t *testing.T) {
+	t.Parallel()
 	p, _, output := test.NewPipelineMock(nil, "passive")
-	p.SetInput(getInputInfo())
+	p.SetInput(getInputInfo(&Config{Address: ":0"}))
 	input := p.GetInput().(*Plugin)
 	p.Start()
 
@@ -162,10 +159,10 @@ func TestProcessChunksContinueMany(t *testing.T) {
 
 	eventBuff := []byte(``)
 
-	eventBuff = input.processChunk(0, []byte(`{`), eventBuff, false)
-	eventBuff = input.processChunk(0, []byte(`"a"`), eventBuff, false)
-	eventBuff = input.processChunk(0, []byte(`:`), eventBuff, false)
-	eventBuff = input.processChunk(0, []byte(`"1"}`), eventBuff, true)
+	eventBuff = input.processChunk(0, []byte(`{`), eventBuff, false, nil)
+	eventBuff = input.processChunk(0, []byte(`"a"`), eventBuff, false, nil)
+	eventBuff = input.processChunk(0, []byte(`:`), eventBuff, false, nil)
+	eventBuff = input.processChunk(0, []byte(`"1"}`), eventBuff, true, nil)
 
 	wg.Wait()
 	p.Stop()
@@ -176,8 +173,9 @@ func TestProcessChunksContinueMany(t *testing.T) {
 }
 
 func TestServeChunks(t *testing.T) {
+	t.Parallel()
 	p, _, output := test.NewPipelineMock(nil, "passive")
-	input := getInputInfo()
+	input := getInputInfo(&Config{Address: ":0"})
 	p.SetInput(input)
 	p.Start()
 
@@ -191,17 +189,23 @@ func TestServeChunks(t *testing.T) {
 	})
 
 	resp := httptest.NewRecorder()
-	input.Plugin.(*Plugin).serve(resp, httptest.NewRequest(http.MethodPost, "/logger", strings.NewReader(`{"a":"1"}`)))
+	input.Plugin.(*Plugin).ServeHTTP(resp, httptest.NewRequest(http.MethodPost, "/logger", strings.NewReader(`{"a":"1"}`)))
 	require.Equal(t, http.StatusOK, resp.Result().StatusCode)
 
 	resp = httptest.NewRecorder()
-	input.Plugin.(*Plugin).serve(resp, httptest.NewRequest(http.MethodPost, "/logger", strings.NewReader(`{"b":"2"}`+"\n")))
+	input.Plugin.(*Plugin).ServeHTTP(resp, httptest.NewRequest(http.MethodPost, "/logger", strings.NewReader(`{"b":"2"}`+"\n")))
 	require.Equal(t, http.StatusOK, resp.Result().StatusCode)
 
 	wg.Wait()
 	p.Stop()
 
-	require.Equal(t, []string{`{"a":"1"}`, `{"b":"2"}`}, outEvents)
+	require.True(t, compareResultMaps(
+		map[string]string{
+			"a": "1",
+			"b": "2",
+		},
+		outEvents,
+	))
 }
 
 type PartialReader struct {
@@ -255,8 +259,9 @@ func (c *PartialReader) WaitRead() {
 }
 
 func TestServePartialRequest(t *testing.T) {
+	t.Parallel()
 	p, _, output := test.NewPipelineMock(nil, "passive")
-	input := getInputInfo()
+	input := getInputInfo(&Config{Address: ":0"})
 	p.SetInput(input)
 
 	wg := sync.WaitGroup{}
@@ -275,7 +280,7 @@ func TestServePartialRequest(t *testing.T) {
 
 	doneCh := make(chan struct{})
 	go func() {
-		input.Plugin.(*Plugin).serve(resp, httptest.NewRequest(http.MethodPost, "/_bulk", reader))
+		input.Plugin.(*Plugin).ServeHTTP(resp, httptest.NewRequest(http.MethodPost, "/_bulk", reader))
 		close(doneCh)
 	}()
 
@@ -295,12 +300,19 @@ func TestServePartialRequest(t *testing.T) {
 	wg.Wait()
 	p.Stop()
 
-	require.Equal(t, []string{`{"hello":"world"}`, `{"next":"ok"}`}, outEvents)
+	require.True(t, compareResultMaps(
+		map[string]string{
+			"hello": "world",
+			"next":  "ok",
+		},
+		outEvents,
+	))
 }
 
 func TestServeChunksContinue(t *testing.T) {
+	t.Parallel()
 	p, _, output := test.NewPipelineMock(nil, "passive")
-	input := getInputInfo()
+	input := getInputInfo(&Config{Address: ":0"})
 	p.SetInput(input)
 	p.Start()
 
@@ -314,25 +326,183 @@ func TestServeChunksContinue(t *testing.T) {
 	})
 
 	body := make([]byte, 0, readBufDefaultLen*2)
+	value := strings.Repeat("a", cap(body))
 	body = append(body, `{"a":"`...)
-	body = append(body, strings.Repeat("a", cap(body))...)
+	body = append(body, value...)
 	body = append(body, `"}`...)
 
 	resp := httptest.NewRecorder()
-	input.Plugin.(*Plugin).serve(resp, httptest.NewRequest(http.MethodPost, "/logger", bytes.NewReader(body)))
+	input.Plugin.(*Plugin).ServeHTTP(resp, httptest.NewRequest(http.MethodPost, "/logger", bytes.NewReader(body)))
 	require.Equal(t, http.StatusOK, resp.Result().StatusCode)
 
 	wg.Wait()
 	p.Stop()
 
-	require.Equal(t, []string{string(body)}, outEvents)
+	require.True(t, compareResultMaps(
+		map[string]string{
+			"a": value,
+		},
+		outEvents,
+	))
+}
+
+func compareResultMaps(expectedValues map[string]string, outEvents []string) bool {
+	result := make([]map[string]string, 0, len(outEvents))
+	for i := range outEvents {
+		var value map[string]string
+		json.Unmarshal([]byte(outEvents[i]), &value)
+		result = append(result, value)
+	}
+
+	expectedResult := make([]map[string]string, 0, len(expectedValues))
+	for field, value := range expectedValues {
+		expectedResult = append(expectedResult, map[string]string{
+			field:         value,
+			"method":      "POST",
+			"remote_addr": "192.0.2.1",
+			"login":       "",
+		})
+	}
+
+	resultSet := make(map[string]struct{})
+	for _, m := range result {
+		jsonValue, _ := json.Marshal(m)
+		resultSet[string(jsonValue)] = struct{}{}
+	}
+
+	expectedResultSet := make(map[string]struct{})
+	for _, m := range expectedResult {
+		jsonValue, _ := json.Marshal(m)
+		expectedResultSet[string(jsonValue)] = struct{}{}
+	}
+
+	return reflect.DeepEqual(resultSet, expectedResultSet)
+}
+
+func TestPluginAuth(t *testing.T) {
+	t.Parallel()
+	r := require.New(t)
+
+	newReq := func(authHeader string) *http.Request {
+		return &http.Request{
+			Header: map[string][]string{
+				"Log-Authorization": {authHeader},
+			},
+		}
+	}
+	encBasic := func(s string) string {
+		return base64.StdEncoding.EncodeToString([]byte(s))
+	}
+
+	tests := []struct {
+		Name       string
+		Strategy   string
+		Request    *http.Request
+		Secrets    map[string]string
+		ShouldPass bool
+		Login      string
+	}{
+		{
+			Name:       "disabled ok",
+			Strategy:   "disabled",
+			ShouldPass: true,
+			Request:    &http.Request{},
+		},
+		// basic test
+		{
+			Name:     "basic ok",
+			Strategy: "basic",
+			Secrets: map[string]string{
+				"ozon": "zonzon",
+			},
+			Request:    newReq("Basic " + encBasic("ozon:zonzon")),
+			ShouldPass: true,
+			Login:      "ozon",
+		},
+		{
+			Name:     "basic reject",
+			Strategy: "basic",
+			Secrets: map[string]string{
+				"ozon": "zonzon",
+			},
+			Request:    newReq("Basic " + encBasic("user:password")),
+			ShouldPass: false,
+		},
+		// bearer test
+		{
+			Name:       "bearer reject",
+			Strategy:   "bearer",
+			Secrets:    map[string]string{},
+			Request:    newReq("Bearer test"),
+			ShouldPass: false,
+		},
+		{
+			Name:     "bearer ok",
+			Strategy: "bearer",
+			Secrets: map[string]string{
+				"ozon": "ozon",
+			},
+			Request:    newReq("Bearer ozon"),
+			ShouldPass: true,
+			Login:      "ozon",
+		},
+		{
+			Name:     "bearer pass one char",
+			Strategy: "bearer",
+			Secrets: map[string]string{
+				"1": "1",
+			},
+			Request:    newReq("Bearer 1"),
+			ShouldPass: true,
+			Login:      "1",
+		},
+		{
+			Name:       "empty bearer",
+			Strategy:   "bearer",
+			Secrets:    map[string]string{},
+			Request:    newReq("Bearer"),
+			ShouldPass: false,
+		},
+	}
+
+	pipelineMock, _, _ := test.NewPipelineMock(nil, "passive")
+
+	for _, tc := range tests {
+		t.Run(tc.Name, func(t *testing.T) {
+			conf := &Config{
+				Auth: AuthConfig{
+					Strategy: tc.Strategy,
+					Header:   "Log-Authorization",
+					Secrets:  tc.Secrets,
+				},
+				Address: "off",
+			}
+			inputInfo := getInputInfo(conf)
+			pipelineMock.SetInput(inputInfo)
+			// init http plugin
+			pipelineMock.Start()
+			pipelineMock.Stop()
+
+			ok, login := inputInfo.Plugin.(*Plugin).auth(tc.Request)
+
+			if len(tc.Secrets) > 0 && tc.ShouldPass {
+				_, exists := tc.Secrets[login]
+				r.Equal(true, exists)
+			} else {
+				r.Equal("", login)
+			}
+
+			r.Equal(tc.ShouldPass, ok)
+			r.Equal(tc.Login, login)
+		})
+	}
 }
 
 func BenchmarkHttpInputJson(b *testing.B) {
 	const NumWorkers = 128
 	const DocumentCount = 128 * 128 * 8
 
-	json, err := os.ReadFile("../../../testdata/json/light.json")
+	inputJson, err := os.ReadFile("../../../testdata/json/light.json")
 	if err != nil {
 		panic(err)
 	}
@@ -343,7 +513,7 @@ func BenchmarkHttpInputJson(b *testing.B) {
 
 	var worker = func(jobs <-chan struct{}) {
 		for range jobs {
-			body := bytes.NewReader(json)
+			body := bytes.NewReader(inputJson)
 			req, err := http.NewRequest(http.MethodPost, "http://localhost:9200", body)
 			if err != nil {
 				panic(err)
@@ -366,7 +536,7 @@ func BenchmarkHttpInputJson(b *testing.B) {
 	for n := 0; n < b.N; n++ {
 		p, _, output := test.NewPipelineMock(nil, "passive", "perf")
 
-		p.SetInput(getInputInfoWithAddr())
+		p.SetInput(getInputInfo(&Config{Address: ":0"}))
 
 		wg := &sync.WaitGroup{}
 		wg.Add(DocumentCount * 2) // 2 rows in each file
@@ -393,5 +563,362 @@ func BenchmarkHttpInputJson(b *testing.B) {
 		wg.Wait()
 
 		p.Stop()
+	}
+}
+
+func TestGzip(t *testing.T) {
+	t.Parallel()
+	r := require.New(t)
+
+	gzipHeaders := http.Header{"Content-Encoding": []string{"gzip"}}
+
+	newReq := func(rawUrl, method string, body string, headers http.Header, useGzip bool) *http.Request {
+		bodyReader := io.Reader(strings.NewReader(body))
+		if useGzip {
+			buf := new(bytes.Buffer)
+
+			gzw := gzip.NewWriter(buf)
+			_, _ = gzw.Write([]byte(body))
+			r.NoError(gzw.Close())
+
+			bodyReader = buf
+		}
+
+		u, err := url.Parse(rawUrl)
+		r.NoError(err)
+
+		return &http.Request{
+			Header: headers,
+			Body:   io.NopCloser(bodyReader),
+			URL:    u,
+			Method: method,
+		}
+	}
+
+	tests := []struct {
+		Name               string
+		Request            *http.Request
+		ExpectedStatusCode int
+		ExpectedBody       string
+		ExpectedEvents     int
+	}{
+		{
+			Name:               "process bulk",
+			Request:            newReq("_bulk", http.MethodPost, strings.Repeat(`{"ping": "pong"}`+"\n", 10), nil, false),
+			ExpectedStatusCode: http.StatusOK,
+			ExpectedBody:       string(result),
+			ExpectedEvents:     10,
+		},
+		{
+			Name:               "process gzipped bulk",
+			Request:            newReq("_bulk", http.MethodPost, strings.Repeat(`{"ok": "google"}`+"\n", 10), gzipHeaders, true),
+			ExpectedStatusCode: http.StatusOK,
+			ExpectedBody:       string(result),
+			ExpectedEvents:     10,
+		},
+		{
+			Name:               "discards invalid requests",
+			Request:            newReq("_bulk", http.MethodPost, `{"ok": "google"}`, gzipHeaders, false),
+			ExpectedStatusCode: http.StatusBadRequest,
+			ExpectedEvents:     0,
+		},
+	}
+
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.Name, func(t *testing.T) {
+			t.Parallel()
+
+			pipelineMock, _, output := test.NewPipelineMock(nil, "passive")
+
+			conf := &Config{Address: "off"}
+			inputInfo := getInputInfo(conf)
+
+			pipelineMock.SetInput(inputInfo)
+			// init http plugin
+			pipelineMock.Start()
+
+			wg := sync.WaitGroup{}
+			wg.Add(tc.ExpectedEvents)
+			cnt := 0
+			output.SetOutFn(func(event *pipeline.Event) {
+				cnt++
+				wg.Done()
+			})
+
+			rec := httptest.NewRecorder()
+
+			inputInfo.Plugin.(*Plugin).ServeHTTP(rec, tc.Request)
+
+			r.Equal(tc.ExpectedStatusCode, rec.Code)
+			if tc.ExpectedBody != "" {
+				r.Equal(tc.ExpectedBody, rec.Body.String())
+			}
+
+			wg.Wait()
+			pipelineMock.Stop()
+		})
+	}
+}
+
+func TestCORSPrepareAllowedOrigins(t *testing.T) {
+	t.Parallel()
+	r := require.New(t)
+
+	type allowedOriginsCfg struct {
+		allowedOriginsDomains []originDomain
+		allowedOriginsAll     bool
+	}
+
+	tests := []struct {
+		Name    string
+		Args    []string
+		Want    allowedOriginsCfg
+		WantErr bool
+	}{
+		{
+			Name: "ok_simple_host",
+			Args: []string{
+				"http://example.com",
+			},
+			Want: allowedOriginsCfg{
+				allowedOriginsDomains: []originDomain{
+					{
+						domain: "http://example.com",
+					},
+				},
+				allowedOriginsAll: false,
+			},
+		},
+		{
+			Name: "ok_suffix",
+			Args: []string{
+				"*.example.com",
+			},
+			Want: allowedOriginsCfg{
+				allowedOriginsDomains: []originDomain{
+					{
+						suffix: ".example.com",
+					},
+				},
+				allowedOriginsAll: false,
+			},
+		},
+		{
+			Name: "ok_prefix",
+			Args: []string{
+				"http://example.*",
+			},
+			Want: allowedOriginsCfg{
+				allowedOriginsDomains: []originDomain{
+					{
+						prefix: "http://example.",
+					},
+				},
+				allowedOriginsAll: false,
+			},
+		},
+		{
+			Name: "ok_prefix_and_suffix",
+			Args: []string{
+				"http://*.example.com",
+			},
+			Want: allowedOriginsCfg{
+				allowedOriginsDomains: []originDomain{
+					{
+						prefix: "http://",
+						suffix: ".example.com",
+					},
+				},
+				allowedOriginsAll: false,
+			},
+		},
+		{
+			Name: "ok_mixed",
+			Args: []string{
+				"*.example.com",
+				"http://otherexample.com",
+			},
+			Want: allowedOriginsCfg{
+				allowedOriginsDomains: []originDomain{
+					{
+						suffix: ".example.com",
+					},
+					{
+						domain: "http://otherexample.com",
+					},
+				},
+				allowedOriginsAll: false,
+			},
+		},
+		{
+			Name: "ok_wildcard",
+			Args: []string{
+				"*",
+			},
+			Want: allowedOriginsCfg{
+				allowedOriginsDomains: nil,
+				allowedOriginsAll:     true,
+			},
+		},
+		{
+			Name: "ok_wildcard_mixed",
+			Args: []string{
+				"example.com",
+				"*.example.com",
+				"*",
+			},
+			Want: allowedOriginsCfg{
+				allowedOriginsDomains: nil,
+				allowedOriginsAll:     true,
+			},
+		},
+		{
+			Name: "invalid_domain",
+			Args: []string{
+				"*.*example.com",
+			},
+			Want:    allowedOriginsCfg{},
+			WantErr: true,
+		},
+		{
+			Name: "ok_host_with_port",
+			Args: []string{
+				"http://localhost:8090",
+			},
+			Want: allowedOriginsCfg{
+				allowedOriginsDomains: []originDomain{
+					{
+						domain: "http://localhost:8090",
+					},
+				},
+				allowedOriginsAll: false,
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.Name, func(t *testing.T) {
+			t.Parallel()
+			corsCfg := CORSConfig{
+				AllowedOrigins: tc.Args,
+			}
+			err := corsCfg.prepareAllowedOrigins()
+			if tc.WantErr {
+				r.Error(err, "expected an error")
+				return
+			}
+			r.NoError(err, "expected no errors")
+			r.Equal(tc.Want.allowedOriginsAll, corsCfg.allowedOriginsAll, "allowedOriginsAll not equal")
+			r.Equal(len(tc.Want.allowedOriginsDomains), len(corsCfg.allowedOriginsDomains), "allowedOriginsDomains not equal")
+			for i := range tc.Want.allowedOriginsDomains {
+				wantDomain := tc.Want.allowedOriginsDomains[i]
+				gotDomain := corsCfg.allowedOriginsDomains[i]
+				r.Equal(wantDomain.domain, gotDomain.domain, "domains are not equal")
+				r.Equal(wantDomain.suffix, gotDomain.suffix, "domain suffixes are not equal")
+			}
+		})
+	}
+}
+
+func TestCORSGetAllowedByOrigin(t *testing.T) {
+	t.Parallel()
+	r := require.New(t)
+
+	tests := []struct {
+		Name           string
+		DefaultOrigin  string
+		AllowedOrigins []string
+		CheckOrigin    string
+		Want           string
+	}{
+		{
+			Name:          "ok_domain",
+			DefaultOrigin: "http://default.com",
+			AllowedOrigins: []string{
+				"http://example.com",
+			},
+			CheckOrigin: "http://example.com",
+			Want:        "http://example.com",
+		},
+		{
+			Name:          "ok_suffix",
+			DefaultOrigin: "http://default.com",
+			AllowedOrigins: []string{
+				"*.example.com",
+			},
+			CheckOrigin: "http://test.example.com",
+			Want:        "http://test.example.com",
+		},
+		{
+			Name:          "ok_prefix",
+			DefaultOrigin: "http://default.com",
+			AllowedOrigins: []string{
+				"http://example.*",
+			},
+			CheckOrigin: "http://example.example.org",
+			Want:        "http://example.example.org",
+		},
+		{
+			Name:          "ok_prefix_and_suffix",
+			DefaultOrigin: "http://default.com",
+			AllowedOrigins: []string{
+				"http://*.example.com:8090",
+			},
+			CheckOrigin: "http://subtest.test.example.com:8090",
+			Want:        "http://subtest.test.example.com:8090",
+		},
+		{
+			Name:          "ok_wildcard",
+			DefaultOrigin: "http://default.com",
+			AllowedOrigins: []string{
+				"*",
+			},
+			CheckOrigin: "http://example.com",
+			Want:        "http://example.com",
+		},
+		{
+			Name:          "default_origin",
+			DefaultOrigin: "http://default.com",
+			AllowedOrigins: []string{
+				"http://example.com",
+			},
+			CheckOrigin: "http://otherexample.com",
+			Want:        "http://default.com",
+		},
+		{
+			Name:          "ok_host_port",
+			DefaultOrigin: "http://default.com",
+			AllowedOrigins: []string{
+				"http://localhost:8090",
+			},
+			CheckOrigin: "http://localhost:8090",
+			Want:        "http://localhost:8090",
+		},
+		{
+			Name:          "ok_host_port_suffix",
+			DefaultOrigin: "http://default.com",
+			AllowedOrigins: []string{
+				"*.example.com:8090",
+			},
+			CheckOrigin: "http://test.example.com:8090",
+			Want:        "http://test.example.com:8090",
+		},
+	}
+
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.Name, func(t *testing.T) {
+			t.Parallel()
+			corsCfg := CORSConfig{
+				AllowedOrigins: tc.AllowedOrigins,
+				DefaultOrigin:  tc.DefaultOrigin,
+			}
+			err := corsCfg.prepareAllowedOrigins()
+			r.NoError(err, "expected no errors")
+			gotOrigin := corsCfg.getAllowedByOrigin(tc.CheckOrigin)
+			r.Equal(tc.Want, gotOrigin, "origin not equal")
+		})
 	}
 }

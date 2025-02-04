@@ -12,54 +12,42 @@ concurrency:
 
 jobs:
   test:
-    runs-on: ${{ matrix.runner }}
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        flags: [ '' ]
-        go: [ '1.20' ]
-        arch: [ amd64 ]
-        runner: [ ubuntu-latest ]
-        include:
-          - arch: amd64
-            runner: ubuntu-latest
-            flags: -race
+        flags: [ '', '-race' ]
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Install Go
         uses: actions/setup-go@v4
         with:
-          go-version: ${{ matrix.go }}
+          go-version: '1.21'
           cache: true
 
       - name: Build
-        env:
-          GOARCH: ${{ matrix.arch }}
-          GOFLAGS: ${{ matrix.flags }}
         run: go build ./...
 
       - name: Test
         env:
-          GOARCH: ${{ matrix.arch }}
           GOFLAGS: ${{ matrix.flags }}
           LOG_LEVEL: error
-        run: go test -coverprofile=profile.out -covermode=atomic -v -coverpkg=./... ./...
+        run: go test -coverprofile=profile${{ matrix.flags }}.out -covermode=atomic -v -coverpkg=./... ./...
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
-          name: coverage
-          path: profile.out
+          name: coverage${{ matrix.flags }}
+          path: profile${{ matrix.flags }}.out
           if-no-files-found: error
           retention-days: 1
 
       - name: Run benchmarks
         if: ${{ !contains(matrix.flags, '-race') }}
         env:
-          GOARCH: ${{ matrix.arch }}
-          GOFLAGS: ${{ matrix.flags }}
+          LOG_LEVEL: error
         run: go test --timeout=15m --benchtime=3x --benchmem --bench="BenchmarkLightJsonReadPar" --run=$^ ./plugin/input/file/...
 
   e2e_test:
@@ -67,42 +55,31 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        flags: [ '' ]
-        go: [ '1.20' ]
-        arch: [ amd64 ]
-        runner: [ ubuntu-latest ]
-        include:
-          - arch: amd64
-            runner: ubuntu-latest
-            flags: -race
+        flags: [ '', '-race' ]
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Install Go
         uses: actions/setup-go@v4
         with:
-          go-version: '1.20'
+          go-version: '1.21'
           cache: true
 
-      - name: Run Kafka
-        run: docker compose -f ./e2e/kafka_file/docker-compose-kafka.yml up -d
-
-      - name: Run Clickhouse
-        run: docker compose -f ./e2e/file_clickhouse/docker-compose.yml up -d
+      - name: Run docker containers
+        run: make test-e2e-docker-up
 
       - name: E2E
         env:
-          GOARCH: ${{ matrix.arch }}
           GOFLAGS: ${{ matrix.flags }}
           LOG_LEVEL: error
-        run: go test ./e2e -coverprofile=profile_e2e.out -covermode=atomic -tags=e2e_new -timeout=3m -coverpkg=./...
+        run: go test ./e2e -coverprofile=profile-e2e${{ matrix.flags }}.out -covermode=atomic -tags=e2e_new -timeout=3m -coverpkg=./...
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
-          name: coverage
-          path: profile_e2e.out
+          name: coverage-e2e${{ matrix.flags }}
+          path: profile-e2e${{ matrix.flags }}.out
           if-no-files-found: error
           retention-days: 1
 
@@ -113,28 +90,29 @@ jobs:
       - e2e_test
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Download artifact
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
-          name: coverage
+          pattern: coverage*
+          merge-multiple: true
 
       - name: Send coverage
         uses: codecov/codecov-action@v3
         with:
-          files: profile.out, profile_e2e.out
+          files: profile.out, profile-race.out, profile-e2e.out, profile-e2e-race.out,
 
   lint:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Install Go
         uses: actions/setup-go@v4
         with:
-          go-version: '1.20'
+          go-version: '1.21'
           cache: true
 
       - name: Lint
@@ -154,12 +132,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Install Go
         uses: actions/setup-go@v4
         with:
-          go-version: '1.20'
+          go-version: '1.21'
           cache: true
 
       - name: Generate doc
@@ -178,12 +156,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Install Go
         uses: actions/setup-go@v4
         with:
-          go-version: '1.20'
+          go-version: '1.21'
           cache: true
 
       - name: Download dependencies

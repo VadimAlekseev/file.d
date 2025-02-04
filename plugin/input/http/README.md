@@ -44,7 +44,7 @@ pipelines:
 ```
 
 Setup:
-```
+```bash
 # run server.
 # config.yaml should contains yaml config above.
 go run ./cmd/file.d --config=config.yaml
@@ -54,9 +54,7 @@ curl "localhost:9200/_bulk" -H 'Content-Type: application/json' -d \
 '{"index":{"_index":"index-main","_type":"span"}}
 {"message": "hello", "kind": "normal"}
 '
-
-##
-
+```
 
 ### Config params
 **`address`** *`string`* *`default=:9200`* 
@@ -85,5 +83,64 @@ If both ca_cert and private_key are set, the server starts accepting connections
 
 <br>
 
+**`auth`** *`AuthConfig`* 
 
+Auth config.
+Disabled by default.
+See AuthConfig for details.
+You can use 'warn' log level for logging authorizations.
+
+<br>
+
+**`meta`** *`cfg.MetaTemplates`* 
+
+Meta params
+
+Add meta information to an event (look at Meta params)
+Use [go-template](https://pkg.go.dev/text/template) syntax
+
+Example: ```user_agent: '{{ index (index .request.Header "User-Agent") 0}}'```
+
+<br>
+
+**`cors`** *`CORSConfig`* 
+
+CORS config.
+Allowed origins support only one wildcard symbol. `http://*.example.com` - valid, `http://*.example.*.com` - invalid.
+See CORSConfig for details.
+
+<br>
+
+**`header`** *`string`* *`default=Authorization`* 
+
+Override default Authorization header
+
+<br>
+
+**`strategy`** *`string`* *`default=disabled`* *`options=disabled|basic|bearer`* 
+
+AuthStrategy.Strategy describes strategy to use.
+
+<br>
+
+**`secrets`** *`map[string]string`* 
+
+AuthStrategy.Secrets describes secrets in key-value format.
+If the `strategy` is basic, then the key is the login, the value is the password.
+If the `strategy` is bearer, then the key is the name, the value is the Bearer token.
+Key uses in the http_input_total metric.
+
+<br>
+
+
+### Meta params
+**`login`**
+
+**`remote_addr`**  *`net.IP`*
+
+**`request`**  *`http.Request`*
+
+**`params`**  *`url.Values`*
+
+**`request_uuid`**  *`string`*
 <br>*Generated using [__insane-doc__](https://github.com/vitkovskii/insane-doc)*
